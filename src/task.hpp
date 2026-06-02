@@ -59,16 +59,22 @@ public:
 
     Task(Task&& o) noexcept
         : invoke_(o.invoke_), destroy_(o.destroy_), move_(o.move_) {
-        if (move_) move_(buf_, o.buf_);
-        o.invoke_ = o.destroy_ = nullptr; o.move_ = nullptr;
+        if (move_) {
+            move_(buf_, o.buf_);  // move-construct Fn into our buffer
+            o.destroy_(o.buf_);   // destroy the moved-from object in o's buffer
+            o.invoke_ = o.destroy_ = nullptr; o.move_ = nullptr;
+        }
     }
 
     Task& operator=(Task&& o) noexcept {
         if (this != &o) {
             reset();
             invoke_ = o.invoke_; destroy_ = o.destroy_; move_ = o.move_;
-            if (move_) move_(buf_, o.buf_);
-            o.invoke_ = o.destroy_ = nullptr; o.move_ = nullptr;
+            if (move_) {
+                move_(buf_, o.buf_);
+                o.destroy_(o.buf_);  // same: destroy moved-from object
+                o.invoke_ = o.destroy_ = nullptr; o.move_ = nullptr;
+            }
         }
         return *this;
     }
