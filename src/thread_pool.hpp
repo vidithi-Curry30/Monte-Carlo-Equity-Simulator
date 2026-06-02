@@ -1,30 +1,40 @@
 #pragma once
 #include <atomic>
 #include <condition_variable>
-#include <functional>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
+#include "task.hpp"
 
 // Hand-rolled fixed-size thread pool.
 //
 // Design decisions worth knowing:
 //
-// 1. pending_ is std::atomic<int>, not a plain int under the task mutex.
-//    Incrementing before enqueue and decrementing after task completion
-//    means wait() can safely spin-check without holding the task lock.
+// 1. Tasks are stored as Task (src/task.hpp), not std::function. Task uses
+//    a 64-byte inline buffer so submission never allocates. std::function's
+//    SBO is implementation-defined and its heap fallback showed up in
+//    profiles when submitting millions of short-lived tasks.
 //
-// 2. Two condition variables: cv_ wakes workers when work arrives or the
+// 2. pending_ is std::atomic<int>, not a plain int under the task mutex.
+//    Incrementing before enqueue and decrementing after task completion
+//    means wait() can safely check without holding the task lock.
+//
+// 3. Two condition variables: cv_ wakes workers when work arrives or the
 //    pool is stopping; done_cv_ wakes the caller of wait() when pending_
 //    hits zero. A single cv_ would require the caller to re-acquire the
-//    task mutex on every task completion, creating unnecessary contention.
+//    task mutex on every completion, adding unnecessary contention.
 //
-// 3. stop_ is read under mutex_ so workers see it correctly when they
+// 4. stop_ is read under mutex_ so workers see it correctly when they
 //    wake from cv_.wait(). No separate atomic needed.
 //
-// 4. RAII: the destructor sets stop_, drains sleeping workers via
+// 5. RAII: the destructor sets stop_, drains sleeping workers via
 //    notify_all(), then joins every thread. No detached threads, no leaks.
+//
+// Known limitation: the internal queue is unbounded. For this project
+// (submit N tasks, wait, repeat) that's fine — the caller naturally
+// throttles submission. A general-purpose pool would need a capacity
+// limit and backpressure.
 
 class ThreadPool {
 public:
@@ -72,7 +82,7 @@ public:
 private:
     void worker_loop() {
         while (true) {
-            std::function<void()> task;
+            Task task;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
@@ -88,8 +98,8 @@ private:
         }
     }
 
-    std::vector<std::thread>        workers_;
-    std::queue<std::function<void()>> tasks_;
+    std::vector<std::thread> workers_;
+    std::queue<Task>         tasks_;
     std::mutex                      mutex_;
     std::condition_variable         cv_;
     std::mutex                      done_mutex_;

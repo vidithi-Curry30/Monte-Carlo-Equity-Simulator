@@ -1,100 +1,105 @@
 # Monte Carlo Equity Simulator
 
-A high-performance C++ simulator for equity price distributions using Geometric Brownian Motion. Designed around the same performance priorities as production quant systems: minimal latency, no heap allocation in the hot path, and linear scaling across cores.
+A high-performance C++ simulator for equity price distributions. Runs millions of price paths under two models — Geometric Brownian Motion and Merton Jump-Diffusion — and outputs a risk report with VaR, CVaR, and a full percentile distribution.
 
-## What it does
+The design priorities are the same as production low-latency systems: no heap allocation in the hot path, no shared mutable state between threads, and measurable performance at every layer.
 
-Given a stock's current price, expected drift, and volatility, the simulator runs millions of possible future price paths and reports:
+## Models
 
-- Full percentile distribution of terminal prices (P5 → P95)
-- Value at Risk (VaR) at 95% and 99% confidence
-- Conditional VaR / Expected Shortfall at 95%
-- Probability of profit
+**GBM** — the standard model, fast and analytically tractable. Assumes smooth continuous price moves; underestimates tail risk because it has no mechanism for sudden gaps.
 
-## Example
+**Merton Jump-Diffusion** — adds a Poisson-driven jump process on top of GBM. Captures earnings shocks, macro events, and any discontinuous move the diffusion term can't produce. On identical parameters, jump-diffusion consistently produces 35–40% higher VaR and CVaR — a difference that matters for position sizing.
 
 ```
 $ ./build/simulator --price 150 --drift 0.08 --vol 0.20 --years 0.25
 
-=== Monte Carlo Equity Simulator ===
-  S0=150.00  mu=8.00%  sigma=20.00%  T=0.25yr
-  paths=1000000  steps=252
-
-Running simulation... done in 946 ms (1.1M paths/sec)
-
---- Price Distribution ---
-  Mean final price : $153.03
-  Median           : $152.27
-  Std deviation    : $15.36
-
---- Percentiles ---
-   5th pct  : $129.14  [############                  ]
-  50th pct  : $152.27  [###############               ]
-  95th pct  : $179.53  [#################             ]
-
---- Risk Metrics ---
-  VaR  95%                      : $20.86
-  VaR  99%                      : $29.39
-  CVaR 95% (expected shortfall) : $26.07
-
---- Outcome ---
-  Probability of profit : 56.0%  [################              ]
+Model: GBM             VaR95=$20.82  CVaR95=$26.01
+Model: Jump-Diffusion  VaR95=$28.63  CVaR95=$37.14  (+38%, +43%)
 ```
-
-## Performance
-
-Benchmarked on a 4-core machine, 2M paths × 252 steps:
-
-| Mode | Time | Throughput |
-|---|---|---|
-| Single-threaded, standard MC | 10,384 ms | 0.2M paths/sec |
-| Single-threaded, antithetic variates | 7,484 ms | 0.3M paths/sec |
-| 4-thread OpenMP, antithetic variates | 1,908 ms | 1.0M paths/sec |
-
-**5.4× end-to-end speedup** from single-threaded standard MC to parallel antithetic variates.
-
-## Design decisions
-
-**xoshiro256++ RNG** — Replaces `std::mt19937`. ~3× faster, passes PractRand and BigCrush, and is trivially seedable per-thread without locking. The period (2²⁵⁶−1) far exceeds any simulation budget.
-
-**Antithetic variates** — For each random draw Z, a paired path uses −Z. The two paths are negatively correlated, which cancels first-order Monte Carlo variance. In practice: same accuracy as 2× the paths at ~1.4× the wall time.
-
-**Thread-local RNG state** — Each OpenMP thread seeds its own `Xoshiro256pp` from a hash of the loop index. There is no shared mutable state on the hot path — no mutexes, no atomics, no false sharing on cache lines.
-
-**Pre-allocated flat arrays** — `std::vector` is sized once before the parallel loop. No heap allocation occurs inside the simulation. Predictable memory access pattern enables hardware prefetching.
-
-**Exact GBM discretisation** — Uses the log-normal solution `S(t+dt) = S(t) * exp((μ − σ²/2)dt + σ√dt · Z)` rather than an Euler–Maruyama approximation. Zero discretisation error regardless of step size.
-
-**`-O3 -march=native -ffast-math`** — Enables auto-vectorisation and SIMD reductions. The inner `exp()` loop is the bottleneck; `ffast-math` allows the compiler to use SVML or its equivalent.
 
 ## Build
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-```
 
-Requires: CMake ≥ 3.16, a C++17 compiler. OpenMP is optional but recommended.
-
-```bash
 ./build/simulator --help
-./build/bench
+./build/bench       # runs all benchmarks
 ```
+
+Requires: CMake ≥ 3.16, C++17, pthreads. No other dependencies.
+
+## Performance (4-core machine)
+
+**Thread scaling** — near-linear, 3.73× on 4 cores:
+
+| Threads | Time | Throughput | Speedup |
+|---|---|---|---|
+| 1 | 4017 ms | 0.2M paths/sec | 1.0× |
+| 2 | 2017 ms | 0.5M paths/sec | 2.0× |
+| 4 | 1076 ms | 0.9M paths/sec | 3.7× |
+
+**False sharing** — `alignas(64)` on per-thread state is 1.8× faster under contention. The benchmark uses `volatile` counters to force real memory writes; without it the compiler keeps everything in registers and the effect disappears entirely.
+
+**SPSC queue** — 16× higher throughput than `std::mutex + std::queue` at 10M items/sec:
+
+| | Throughput |
+|---|---|
+| Mutex queue | 13M items/sec |
+| SPSC lock-free | 214M items/sec |
+
+## Architecture
+
+```
+src/
+  rng.hpp             xoshiro256++ — 3× faster than mt19937, 32-byte state
+  task.hpp            SBO callable wrapper replacing std::function
+  thread_pool.hpp     Hand-rolled pool: condition_variable + atomic pending counter
+  simulator.hpp       Simulator<Model> template — zero virtual dispatch
+  gbm.hpp             GBM model policy
+  jump_diffusion.hpp  Merton jump-diffusion model policy
+  stats.hpp           VaR, CVaR, percentile computation
+  main.cpp            CLI
+benchmark/
+  bench.cpp           False sharing, SPSC vs mutex, model comparison, thread scaling
+```
+
+## Design decisions
+
+**`task.hpp` — SBO callable, not `std::function`**
+
+`std::function`'s SBO buffer size is implementation-defined and its heap fallback is not guaranteed to be absent. `Task` uses a fixed 64-byte inline buffer (one cache line). If the callable exceeds 64 bytes, a `static_assert` fires immediately with a message explaining what to do — not a cryptic linker error three files deep. A separate `move_` function pointer ensures move construction is correct for any callable type, not just trivially-copyable ones.
+
+**`spsc_queue.hpp` — lock-free single-producer/consumer queue**
+
+Head and tail indices are `uint64_t` and never wrap — at one billion operations per second, overflow takes 585 years. They sit on separate `alignas(64)` cache lines so the producer and consumer never invalidate each other's state. Capacity is a power-of-2 checked at compile time via `static_assert`; the queue uses bitmask indexing rather than modulo. `size_approx()` is deliberately named approximate — in a concurrent queue, an "exact" size is meaningless between the two atomic loads required to compute it.
+
+**`thread_pool.hpp` — two condition variables**
+
+`cv_` wakes workers when tasks arrive or the pool stops. `done_cv_` wakes the `wait()` caller when the atomic `pending_` counter hits zero. A single condition variable would force `wait()` to re-acquire the task mutex on every completion, adding contention on the critical path when tasks complete in rapid succession.
+
+**`simulator.hpp` — `alignas(64)` on `WorkerState`**
+
+Each thread's RNG state and work range live in one `WorkerState`. Without alignment, adjacent workers can share a cache line; every write by one core triggers a coherence invalidation visible to the other. The false sharing benchmark in `bench.cpp` makes this measurable: 1.8× slower without the alignment.
+
+**`Simulator<Model>` template**
+
+The model (GBM, MertonJump) is a compile-time template parameter, not a virtual base class. No vtable, no indirect call, no pointer indirection — the compiler sees the full implementation of `simulate_antithetic` at the call site and can inline and vectorise it. Adding a new model means writing a struct with two static methods; the simulator and benchmark pick it up with no other changes.
 
 ## The math
 
-Price follows Geometric Brownian Motion:
-
+GBM exact discrete solution (no Euler-Maruyama error):
 ```
-dS = S · (μ dt + σ dW)
-```
-
-where `dW = sqrt(dt) · Z`, `Z ~ N(0,1)`. The exact discrete solution is:
-
-```
-S(t+dt) = S(t) · exp((μ - σ²/2) · dt + σ · sqrt(dt) · Z)
+S(t+dt) = S(t) · exp((μ - σ²/2)·dt + σ·√dt·Z),  Z ~ N(0,1)
 ```
 
-The `σ²/2` term is the Itô correction — it converts the arithmetic drift to the geometric drift needed for the log-normal distribution. This is the same model underlying the Black-Scholes options pricing formula.
+The `σ²/2` Itô correction converts arithmetic drift to geometric drift so that `E[S(T)] = S₀·exp(μT)`.
 
-Normal samples are generated via the Box-Muller transform from uniform draws.
+Merton jump-diffusion adds a compound Poisson term:
+```
+S(t+dt) = S_GBM(t+dt) · exp(J·N),  N ~ Bernoulli(λ·dt),  J ~ N(μⱼ, σⱼ²)
+```
+
+The continuous drift is reduced by `λ·κ` (where `κ = E[eᴶ] - 1`) so total expected return stays equal to `μ` regardless of jump intensity.
+
+Normal samples come from Box-Muller applied to xoshiro256++ uniform draws.
