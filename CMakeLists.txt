@@ -8,18 +8,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # -ffast-math lets the compiler reorder FP ops and use SIMD reductions.
 add_compile_options(-O3 -march=native -ffast-math)
 
-find_package(OpenMP)
+find_package(Threads REQUIRED)
 
 # ── Main simulator binary ──────────────────────────────────────────────
 add_executable(simulator src/main.cpp)
 target_include_directories(simulator PRIVATE src)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(simulator OpenMP::OpenMP_CXX)
-endif()
+target_link_libraries(simulator Threads::Threads)
 
 # ── Benchmark binary ───────────────────────────────────────────────────
 add_executable(bench benchmark/bench.cpp)
 target_include_directories(bench PRIVATE src)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(bench OpenMP::OpenMP_CXX)
-endif()
+target_link_libraries(bench Threads::Threads)

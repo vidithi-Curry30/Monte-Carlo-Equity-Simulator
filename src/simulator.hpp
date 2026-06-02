@@ -1,45 +1,77 @@
 #pragma once
-#include <vector>
 #include <chrono>
-#include "gbm.hpp"
-#include "stats.hpp"
+#include <cstdint>
+#include <vector>
+#include "rng.hpp"
+#include "thread_pool.hpp"
 
 struct SimResult {
     std::vector<double> final_prices;
     double elapsed_ms;
 };
 
-// Run num_paths GBM simulations in parallel using OpenMP.
+// Per-thread worker state.
 //
-// Each thread gets its own Xoshiro256pp seeded with (base_seed + thread_id)
-// so there is zero shared mutable state on the hot path — no mutexes,
-// no atomics, no false sharing. This is the standard pattern for
-// parallel Monte Carlo in production systems.
-SimResult run_simulation(const GBMParams& params, int num_paths, uint64_t base_seed = 42) {
-    std::vector<double> prices;
-    prices.resize(num_paths);
+// alignas(64) is the critical detail: a typical x86 cache line is 64 bytes.
+// Without alignment, adjacent WorkerState objects may share a cache line.
+// When thread A writes its rng state and thread B writes its results slice,
+// both cores send "I own this cache line" invalidation messages to each other
+// on every write — even though they're accessing different variables.
+// This is false sharing: the penalty is ~100x slower memory access on the
+// contended line. Alignment guarantees each WorkerState occupies its own
+// cache line(s) with no cross-thread overlap.
+struct alignas(64) WorkerState {
+    Xoshiro256pp rng;
+    int          begin;   // index of first path assigned to this worker
+    int          end;     // one past the last path
+};
 
+template<typename Model>
+SimResult run_simulation(
+    const typename Model::Params& params,
+    int      num_paths,
+    int      n_threads,
+    uint64_t base_seed = 42)
+{
+    std::vector<double> prices(num_paths);
+
+    // Divide paths as evenly as possible across threads.
+    // Integer division truncates: give the remainder to the last thread.
+    const int batch = num_paths / n_threads;
+    std::vector<WorkerState> workers(n_threads, WorkerState{Xoshiro256pp(0), 0, 0});
+    for (int t = 0; t < n_threads; ++t) {
+        workers[t].begin = t * batch;
+        workers[t].end   = (t == n_threads - 1) ? num_paths : workers[t].begin + batch;
+        // Seed each thread with a unique hash of (base_seed, thread_id).
+        // Multiplying by a large odd constant (Knuth's multiplicative hash)
+        // ensures seeds that differ by 1 produce uncorrelated RNG streams.
+        workers[t].rng = Xoshiro256pp(base_seed + static_cast<uint64_t>(t) * 2654435761ULL);
+    }
+
+    ThreadPool pool(n_threads);
     const auto t0 = std::chrono::high_resolution_clock::now();
 
-    // Antithetic variates: each iteration produces 2 prices, so we only
-    // need num_paths/2 RNG calls. Pre-size to exact count.
-    const int half = num_paths / 2;
+    for (int t = 0; t < n_threads; ++t) {
+        // Capture by pointer: WorkerState is non-copyable (Xoshiro256pp has
+        // no copy constructor), and the vector outlives all tasks.
+        WorkerState* ws = &workers[t];
+        double*      out = prices.data();
 
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (int i = 0; i < half; ++i) {
-        // Thread-local RNG: seed offset by loop index ensures independent streams.
-        Xoshiro256pp rng(base_seed + static_cast<uint64_t>(i) * 2654435761ULL);
-        auto [p_pos, p_neg] = simulate_antithetic(params, rng);
-        prices[2 * i]     = p_pos;
-        prices[2 * i + 1] = p_neg;
+        pool.submit([ws, out, &params] {
+            int i = ws->begin;
+            // Process pairs of paths with antithetic variates.
+            for (; i + 1 < ws->end; i += 2) {
+                auto [p_pos, p_neg] = Model::simulate_antithetic(params, ws->rng);
+                out[i]     = p_pos;
+                out[i + 1] = p_neg;
+            }
+            // Handle a trailing odd path if this thread's range is odd-sized.
+            if (i < ws->end)
+                out[i] = Model::simulate_path(params, ws->rng);
+        });
     }
-    // Handle the odd path if num_paths is not even.
-    if (num_paths % 2 != 0) {
-        Xoshiro256pp rng(base_seed + static_cast<uint64_t>(half) * 2654435761ULL + 1);
-        prices[num_paths - 1] = simulate_path(params, rng);
-    }
+
+    pool.wait();
 
     const auto t1 = std::chrono::high_resolution_clock::now();
     const double elapsed_ms =

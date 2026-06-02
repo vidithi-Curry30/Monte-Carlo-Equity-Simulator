@@ -1,85 +1,119 @@
+#include <atomic>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <thread>
 #include <vector>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 #include "../src/gbm.hpp"
+#include "../src/jump_diffusion.hpp"
 #include "../src/simulator.hpp"
+#include "../src/stats.hpp"
 
-// Measures raw simulation throughput and the speedup from antithetic variates
-// and OpenMP parallelism. Run this to produce the numbers for your README.
+// ── False sharing demonstration ───────────────────────────────────────────
+//
+// False sharing occurs when two threads write to different variables that
+// happen to occupy the same cache line (typically 64 bytes on x86).
+// The CPU cache coherence protocol (MESI) forces the entire line to be
+// invalidated and transferred between cores on every write — even though
+// the threads are touching logically independent data.
+//
+// This benchmark makes the effect concrete and measurable.
 
-static double bench_run(const GBMParams& p, int paths, bool antithetic, uint64_t seed) {
-    std::vector<double> prices(paths);
-    const int half = paths / 2;
+static constexpr int    FS_THREADS    = 4;
+static constexpr long   FS_ITERATIONS = 50'000'000L;
+
+// Bad: all counters packed into 8 bytes each — up to 8 per cache line.
+struct BadCounter {
+    long value = 0;
+};
+
+// Good: each counter owns an entire cache line.
+struct alignas(64) GoodCounter {
+    long value = 0;
+};
+
+template<typename Counter>
+double bench_false_sharing(const char* label) {
+    std::vector<Counter> counters(FS_THREADS);
+    std::vector<std::thread> threads;
 
     auto t0 = std::chrono::high_resolution_clock::now();
-
-    if (antithetic) {
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (int i = 0; i < half; ++i) {
-            Xoshiro256pp rng(seed + static_cast<uint64_t>(i) * 2654435761ULL);
-            auto [a, b] = simulate_antithetic(p, rng);
-            prices[2*i] = a; prices[2*i+1] = b;
-        }
-    } else {
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (int i = 0; i < paths; ++i) {
-            Xoshiro256pp rng(seed + static_cast<uint64_t>(i) * 2654435761ULL);
-            prices[i] = simulate_path(p, rng);
-        }
+    for (int t = 0; t < FS_THREADS; ++t) {
+        threads.emplace_back([&counters, t] {
+            for (long i = 0; i < FS_ITERATIONS; ++i)
+                counters[t].value++;
+        });
     }
-
+    for (auto& th : threads) th.join();
     auto t1 = std::chrono::high_resolution_clock::now();
-    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::cout << "  " << std::left << std::setw(30) << label
+              << std::right << std::setw(8) << std::fixed << std::setprecision(1)
+              << ms << " ms\n";
+    return ms;
+}
+
+// ── Model comparison ──────────────────────────────────────────────────────
+
+template<typename Model>
+void bench_model(const typename Model::Params& params, int paths, int threads, uint64_t seed) {
+    auto result = run_simulation<Model>(params, paths, threads, seed);
+    auto report = compute_risk(result.final_prices, params.S0);
+    const double throughput = paths / (result.elapsed_ms / 1000.0) / 1e6;
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  " << std::left << std::setw(26) << Model::name()
+              << " | " << std::right << std::setw(7) << result.elapsed_ms << " ms"
+              << " | " << std::setprecision(1) << std::setw(5) << throughput << "M p/s"
+              << " | VaR95=$" << std::setprecision(2) << report.var_95
+              << "  CVaR95=$" << report.cvar_95
+              << "\n";
 }
 
 int main() {
-    const GBMParams params{150.0, 0.08, 0.20, 1.0, 252};
-    const int PATHS = 2'000'000;
-    const int REPS  = 5;
+    const int N_THREADS = static_cast<int>(std::thread::hardware_concurrency());
+    const int PATHS     = 1'000'000;
 
-    std::cout << std::fixed << std::setprecision(1);
-    std::cout << "Benchmark: " << PATHS/1'000'000 << "M paths, "
-              << params.steps << " steps each, " << REPS << " repetitions\n\n";
+    // ── 1. False sharing ──────────────────────────────────────────────────
+    std::cout << "=== False Sharing Benchmark (" << FS_THREADS << " threads, "
+              << FS_ITERATIONS / 1'000'000 << "M increments each) ===\n";
+    const double t_bad  = bench_false_sharing<BadCounter> ("Unaligned (false sharing)");
+    const double t_good = bench_false_sharing<GoodCounter>("alignas(64) (no sharing)");
+    std::cout << "  Speedup: " << std::setprecision(1) << (t_bad / t_good) << "x\n";
+    std::cout << "  sizeof(BadCounter)="  << sizeof(BadCounter)
+              << "  sizeof(GoodCounter)=" << sizeof(GoodCounter) << "\n\n";
 
-    auto run_avg = [&](bool antithetic) {
-        double total = 0;
-        for (int r = 0; r < REPS; ++r)
-            total += bench_run(params, PATHS, antithetic, 42 + r);
-        return total / REPS;
-    };
+    // ── 2. Model comparison: GBM vs Jump-Diffusion ────────────────────────
+    const double S0 = 150.0, mu = 0.08, sigma = 0.20, T = 0.25;
+    std::cout << "=== Model Comparison (" << PATHS/1'000'000 << "M paths, "
+              << N_THREADS << " threads) ===\n";
+    std::cout << "  S0=$" << S0 << "  mu=" << mu*100 << "%"
+              << "  sigma=" << sigma*100 << "%  T=" << T << "yr\n\n";
 
-    const double t_plain      = run_avg(false);
-    const double t_antithetic = run_avg(true);
+    GBM::Params gbm_p{S0, mu, sigma, T, 252};
+    bench_model<GBM>(gbm_p, PATHS, N_THREADS, 42);
 
-    const double mp_plain      = PATHS / (t_plain      / 1000.0) / 1e6;
-    const double mp_antithetic = PATHS / (t_antithetic / 1000.0) / 1e6;
+    MertonJump::Params jump_p{S0, mu, sigma, T, 252, 3.0, -0.05, 0.08};
+    bench_model<MertonJump>(jump_p, PATHS, N_THREADS, 42);
 
-    std::cout << "  Standard MC     : " << std::setw(8) << t_plain
-              << " ms avg  (" << mp_plain << " M paths/sec)\n";
-    std::cout << "  Antithetic var. : " << std::setw(8) << t_antithetic
-              << " ms avg  (" << mp_antithetic << " M paths/sec)\n";
-    std::cout << "\n  Antithetic speedup: " << (t_plain / t_antithetic) << "x\n";
+    std::cout << "\n  Jump-diffusion produces higher VaR/CVaR because it models\n"
+              << "  discrete price gaps (earnings, macro shocks) that GBM cannot.\n\n";
 
-#ifdef _OPENMP
-    int n_threads = 0;
-    #pragma omp parallel
-    {
-        #pragma omp single
-        n_threads = omp_get_num_threads();
+    // ── 3. Thread scaling ─────────────────────────────────────────────────
+    std::cout << "=== Thread Scaling (GBM, " << PATHS/1'000'000 << "M paths) ===\n";
+    double t_single = 0;
+    for (int t = 1; t <= N_THREADS; t = (t == 1 ? 2 : t + 2)) {
+        auto result = run_simulation<GBM>(gbm_p, PATHS, t, 42);
+        const double tput = PATHS / (result.elapsed_ms / 1000.0) / 1e6;
+        if (t == 1) t_single = result.elapsed_ms;
+        std::cout << "  threads=" << std::setw(2) << t
+                  << "  " << std::setw(7) << std::fixed << std::setprecision(1)
+                  << result.elapsed_ms << " ms"
+                  << "  (" << std::setprecision(1) << tput << "M p/s)"
+                  << "  speedup=" << std::setprecision(2) << (t_single / result.elapsed_ms) << "x"
+                  << "\n";
     }
-    std::cout << "  OpenMP threads: " << n_threads << "\n";
-#else
-    std::cout << "  (Built without OpenMP — single-threaded)\n";
-#endif
 
-    std::cout << "\nRe-run with OMP_NUM_THREADS=1 to measure single-thread baseline.\n";
     return 0;
 }
