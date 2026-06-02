@@ -38,7 +38,7 @@
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t n_threads) : stop_(false), pending_(0) {
+    explicit ThreadPool(size_t n_threads) : pending_(0), stop_(false) {
         workers_.reserve(n_threads);
         for (size_t i = 0; i < n_threads; ++i)
             workers_.emplace_back([this] { worker_loop(); });

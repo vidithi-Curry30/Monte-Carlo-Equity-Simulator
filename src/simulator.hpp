@@ -38,14 +38,16 @@ SimResult run_simulation(
     // Divide paths as evenly as possible across threads.
     // Integer division truncates: give the remainder to the last thread.
     const int batch = num_paths / n_threads;
-    std::vector<WorkerState> workers(n_threads, WorkerState{Xoshiro256pp(0), 0, 0});
+    std::vector<WorkerState> workers;
+    workers.reserve(n_threads);
     for (int t = 0; t < n_threads; ++t) {
-        workers[t].begin = t * batch;
-        workers[t].end   = (t == n_threads - 1) ? num_paths : workers[t].begin + batch;
+        const int begin = t * batch;
+        const int end   = (t == n_threads - 1) ? num_paths : begin + batch;
         // Seed each thread with a unique hash of (base_seed, thread_id).
         // Multiplying by a large odd constant (Knuth's multiplicative hash)
         // ensures seeds that differ by 1 produce uncorrelated RNG streams.
-        workers[t].rng = Xoshiro256pp(base_seed + static_cast<uint64_t>(t) * 2654435761ULL);
+        const uint64_t seed = base_seed + static_cast<uint64_t>(t) * 2654435761ULL;
+        workers.push_back(WorkerState{Xoshiro256pp(seed), begin, end});
     }
 
     ThreadPool pool(n_threads);

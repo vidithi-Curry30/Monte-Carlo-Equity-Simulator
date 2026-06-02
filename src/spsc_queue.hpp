@@ -1,9 +1,7 @@
 #pragma once
 #include <atomic>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <new>
 #include <type_traits>
 
 // Lock-free single-producer / single-consumer queue.

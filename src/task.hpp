@@ -1,5 +1,4 @@
 #pragma once
-#include <cstring>
 #include <type_traits>
 
 // Small-buffer-optimised callable — replaces std::function<void()> in the

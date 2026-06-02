@@ -1,6 +1,6 @@
 #pragma once
+#include <cmath>
 #include <cstdint>
-#include <cstring>
 
 // xoshiro256++ — period 2^256-1, passes PractRand and BigCrush.
 // ~3x faster than std::mt19937 with equivalent statistical quality.
@@ -51,7 +51,7 @@ public:
             v = nextDouble() * 2.0 - 1.0;
             s = u * u + v * v;
         } while (s >= 1.0 || s == 0.0);
-        const double mul = __builtin_sqrt(-2.0 * __builtin_log(s) / s);
+        const double mul = std::sqrt(-2.0 * std::log(s) / s);
         spare = v * mul;
         has_spare = true;
         return u * mul;
