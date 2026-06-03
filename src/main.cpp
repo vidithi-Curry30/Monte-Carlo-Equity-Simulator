@@ -9,6 +9,7 @@
 #include "options.hpp"
 #include "simulator.hpp"
 #include "stats.hpp"
+#include "tail_analysis.hpp"
 
 static void print_usage(const char* prog) {
     std::cerr
@@ -30,6 +31,8 @@ static void print_usage(const char* prog) {
         << "  --option  call                      (enables option pricing)\n"
         << "  --strike  Option strike price       (e.g. 155.0)\n"
         << "  --rate    Risk-free rate, decimal   (e.g. 0.05)\n"
+        << "\nComparison mode (requires --csv):\n"
+        << "  --compare Run GBM and Merton side-by-side; report tail underestimation\n"
         << "\nJump-diffusion parameters (--model jump, overrides CSV estimates):\n"
         << "  --lambda  Jump intensity, jumps/yr  (default: 3.0, or from CSV)\n"
         << "  --muj     Mean log-jump size        (default: -0.05, or from CSV)\n"
@@ -76,7 +79,15 @@ static void print_report(const RiskReport& r, const char* model_name,
     row("P75", r.p75);  row("P90", r.p90);
     row("P95", r.p95);
 
+    std::cout << "\n--- Distributional Shape ---\n";
+    std::cout << std::setprecision(3);
+    std::cout << "  Skewness        " << std::showpos << r.skewness
+              << std::noshowpos << "  (negative = left-skewed, crash risk > boom)\n";
+    std::cout << "  Excess kurtosis " << std::showpos << r.excess_kurtosis
+              << std::noshowpos << "  (0 = normal tails; >0 = fatter tails than normal)\n";
+
     std::cout << "\n--- Risk Metrics ---\n";
+    std::cout << std::setprecision(2);
     std::cout << "  VaR  95%  (max loss, 95% conf)  $" << r.var_95  << "\n";
     std::cout << "  VaR  99%                         $" << r.var_99  << "\n";
     std::cout << "  CVaR 95%  (expected shortfall)   $" << r.cvar_95 << "\n";
@@ -131,10 +142,12 @@ int main(int argc, char* argv[]) {
     // Option pricing
     std::string option_type;
     double      strike = 0, rate = 0;
+    bool        do_compare = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string f = argv[i];
-        if (f == "--help") { print_usage(argv[0]); return 0; }
+        if (f == "--help")    { print_usage(argv[0]); return 0; }
+        if (f == "--compare") { do_compare = true; continue; }
         if (i + 1 >= argc) { print_usage(argv[0]); return 1; }
         if      (f == "--price")   S0      = std::atof(argv[++i]);
         else if (f == "--drift")   mu      = std::atof(argv[++i]);
@@ -199,6 +212,23 @@ int main(int argc, char* argv[]) {
               << "  mu="  << mu * 100 << "%"
               << "  sigma=" << sigma * 100 << "%"
               << "  T="   << T << "yr\n";
+
+    // ── Comparison mode ───────────────────────────────────────────────────────
+    if (do_compare) {
+        if (csv_path.empty()) {
+            std::cerr << "--compare requires --csv (needs historical data to calibrate both models)\n";
+            return 1;
+        }
+        try {
+            auto prices = load_prices(csv_path);
+            auto report = run_comparison(prices, T, paths, steps, threads, seed);
+            print_comparison(report, csv_path);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
 
     // ── Run simulation ────────────────────────────────────────────────────────
     if (model == "jump") {
