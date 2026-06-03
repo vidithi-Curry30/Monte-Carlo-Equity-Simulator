@@ -19,3 +19,10 @@ target_link_libraries(simulator Threads::Threads)
 add_executable(bench benchmark/bench.cpp)
 target_include_directories(bench PRIVATE src)
 target_link_libraries(bench Threads::Threads)
+
+# ── Test binary ────────────────────────────────────────────────────────
+enable_testing()
+add_executable(tests tests/test_main.cpp)
+target_include_directories(tests PRIVATE src)
+target_link_libraries(tests Threads::Threads)
+add_test(NAME unit_tests COMMAND tests)
