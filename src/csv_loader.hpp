@@ -183,3 +183,43 @@ ParamEstimates estimate_params(const std::vector<double>& prices) {
         static_cast<int>(jump_returns.size())
     };
 }
+
+// Higher moments of the empirical return distribution.
+// Used to check whether the simulated distribution matches what actually
+// happened in the data — the key diagnostic for model adequacy.
+struct EmpiricalMoments {
+    double skewness;        // typically negative for equities (crash skew)
+    double excess_kurtosis; // typically 3-10 for daily equity returns (fat tails)
+    int    n_returns;
+};
+
+// Compute skewness and excess kurtosis of daily log returns from a price series.
+// The excess kurtosis is the most direct measure of whether log-normal (GBM)
+// is adequate: a value significantly above 0 means GBM will underestimate tail risk.
+inline EmpiricalMoments empirical_moments(const std::vector<double>& prices) {
+    const int n = static_cast<int>(prices.size());
+    std::vector<double> returns(n - 1);
+    for (int i = 0; i < n - 1; ++i)
+        returns[i] = std::log(prices[i + 1] / prices[i]);
+
+    const int m = static_cast<int>(returns.size());
+    double mean = 0.0;
+    for (double r : returns) mean += r;
+    mean /= m;
+
+    double m2 = 0.0, m3 = 0.0, m4 = 0.0;
+    for (double r : returns) {
+        const double d  = r - mean;
+        const double d2 = d * d;
+        m2 += d2;
+        m3 += d2 * d;
+        m4 += d2 * d2;
+    }
+    m2 /= m; m3 /= m; m4 /= m;
+    const double std_dev = std::sqrt(m2);
+
+    const double skewness       = (std_dev > 0) ? m3 / (m2 * std_dev) : 0.0;
+    const double excess_kurtosis = (m2 > 0)     ? m4 / (m2 * m2) - 3.0 : 0.0;
+
+    return EmpiricalMoments{skewness, excess_kurtosis, m};
+}
