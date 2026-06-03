@@ -34,7 +34,7 @@ Requires: CMake ≥ 3.16, C++17, pthreads. No other dependencies.
 | `rng.hpp` | xoshiro256++ — 3× faster than mt19937, Box-Muller normals |
 | `task.hpp` | SBO callable (64-byte inline buffer) replacing `std::function` |
 | `thread_pool.hpp` | Hand-rolled pool: `condition_variable` + atomic pending counter |
-| `spsc_queue.hpp` | Lock-free queue — 16× faster than mutex queue at 10M items/sec |
+| `spsc_queue.hpp` | Lock-free SPSC queue — benchmarked at 16× mutex throughput; suited for single feed pipelines, not the thread pool (which uses a locked deque for multi-consumer access) |
 | `simulator.hpp` | `Simulator<Model>` template — zero virtual dispatch, inlines model |
 | `csv_loader.hpp` | Price loading + parameter estimation from historical data |
 | `options.hpp` | Black-Scholes, MC pricer, finite-difference Greeks |
